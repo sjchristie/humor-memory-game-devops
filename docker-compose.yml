@@ -1,0 +1,106 @@
+services:
+
+  postgres:
+    image: postgres:15.2-alpine
+    container_name: humor-game-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-humor_memory_game}
+      POSTGRES_USER: ${DB_USER:-gameuser}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-gamepass123}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../humor-memory-game/database/combined-init.sql:/docker-entrypoint-initdb.d/01-combined-init.sql:ro
+    networks:
+      - backend-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-gameuser} -d ${DB_NAME:-humor_memory_game}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:7.0-alpine
+    container_name: humor-game-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-gamepass123}
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-gamepass123}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+
+  backend:
+    build:
+      context: ../humor-memory-game/backend/
+      dockerfile: ../humor-memory-game-devops/docker/backend/Dockerfile
+    image: humor-memory-game-backend:latest
+    container_name: humor-game-backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: ${API_PORT:-3001}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-humor_memory_game}
+      DB_USER: ${DB_USER:-gameuser}
+      DB_PASSWORD: ${DB_PASSWORD:-gamepass123}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-gamepass123}
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-key-change-in-production}
+      API_BASE_URL: ${API_BASE_URL:-/api}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://frontend:80}
+    ports:
+      - "3001:3001"
+    networks:
+      - backend-network
+      - frontend-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ../humor-memory-game/frontend/
+      dockerfile: ../humor-memory-game-devops/docker/frontend/Dockerfile
+    image: humor-memory-game-frontend:latest
+    container_name: humor-game-frontend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      API_BASE_URL: ${API_BASE_URL:-/api}
+    ports:
+      - "3000:80"
+    networks:
+      - frontend-network
+    depends_on:
+      backend:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  backend-network:
+    driver: bridge
+  frontend-network:
+    driver: bridge
