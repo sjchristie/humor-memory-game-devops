@@ -39,8 +39,8 @@ services:
 
   backend:
     build:
-      context: ../humor-memory-game/backend/
-      dockerfile: ../humor-memory-game-devops/docker/backend/Dockerfile
+      context: /home/devops/workspace/humor-memory-game/backend
+      dockerfile: /home/devops/workspace/humor-memory-game-devops/docker/backend/Dockerfile
     image: humor-memory-game-backend:latest
     container_name: humor-game-backend
     restart: unless-stopped
@@ -71,8 +71,8 @@ services:
 
   frontend:
     build:
-      context: ../humor-memory-game/frontend/
-      dockerfile: ../humor-memory-game-devops/docker/frontend/Dockerfile
+      context: /home/devops/workspace/humor-memory-game/frontend
+      dockerfile: /home/devops/workspace/humor-memory-game-devops/docker/frontend/Dockerfile
     image: humor-memory-game-frontend:latest
     container_name: humor-game-frontend
     restart: unless-stopped
