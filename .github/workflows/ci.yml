@@ -1,0 +1,255 @@
+name: CI/CD GitOps Loop
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  DOCKERHUB_OWNER: christie62
+  BACKEND_IMAGE:   humor-memory-game-backend
+  FRONTEND_IMAGE:  humor-memory-game-frontend
+
+jobs:
+
+  # ============================================================
+  # JOB 1 — TEST
+  # Checks out the application source and runs backend tests.
+  # Runs on every push and pull request — including feature branches.
+  # Frontend has no test script — backend placeholder exits 0.
+  # ============================================================
+  test:
+    name: 🧪 Test Application
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout Application Source Code
+        uses: actions/checkout@v4
+        with:
+          repository: sjchristie/humor-memory-game
+          token: ${{ secrets.SOURCE_PAT }}
+          path: humor-memory-game
+
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: humor-memory-game/backend/package.json
+
+      - name: 📦 Install Backend Dependencies
+        run: cd humor-memory-game/backend && npm ci
+
+      - name: 🧪 Run Backend Tests
+        run: cd humor-memory-game/backend && npm test
+
+  # ============================================================
+  # JOB 2 — SECURITY SCAN
+  # Runs Trivy against the DevOps repository filesystem.
+  # Flags CRITICAL and HIGH severity vulnerabilities only.
+  # Runs in parallel with Job 1 — does not block or wait for tests.
+  # ============================================================
+  security-scan:
+    name: 🔒 Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout DevOps Repository
+        uses: actions/checkout@v4
+
+      - name: 🔒 Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+
+  # ============================================================
+  # JOB 3 — BUILD AND PUSH
+  # Builds multi-platform Docker images and pushes to Docker Hub.
+  # Only runs on push to main — not on pull requests.
+  # Requires both test and security-scan to pass first.
+  #
+  # Build context pattern:
+  #   Source code  → sjchristie/humor-memory-game (checked out separately)
+  #   Dockerfiles  → humor-memory-game-devops/docker/backend|frontend/
+  #   nginx.conf   → humor-memory-game-devops/docker/frontend/
+  #   start.sh     → humor-memory-game-devops/docker/frontend/
+  #
+  # The frontend Dockerfile references nginx.conf and start.sh which
+  # live in the DevOps repo — not in the frontend source. These are
+  # copied into the frontend build context before the Docker build runs.
+  #
+  # Image tags:
+  #   :latest          — always points to the most recent main build
+  #   :main-<shortsha> — immutable, traceable to the exact commit
+  # ============================================================
+  build-and-push:
+    name: 🏗️ Build and Push Images
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    outputs:
+      short-sha: ${{ steps.short-sha.outputs.sha }}
+
+    steps:
+      - name: 📥 Checkout DevOps Repository (Dockerfiles)
+        uses: actions/checkout@v4
+        with:
+          path: humor-memory-game-devops
+
+      - name: 📥 Checkout Application Source Code
+        uses: actions/checkout@v4
+        with:
+          repository: sjchristie/humor-memory-game
+          token: ${{ secrets.SOURCE_PAT }}
+          path: humor-memory-game
+
+      - name: 🔑 Get Short SHA
+        id: short-sha
+        run: echo "sha=$(git -C humor-memory-game rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: 🐳 Set Up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 🔐 Log In to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 📋 Copy Frontend Config Files Into Build Context
+        # The frontend Dockerfile references nginx.conf and start.sh
+        # which live in the DevOps repo. Copy them into the frontend
+        # source directory so Docker can find them during the build.
+        run: |
+          cp humor-memory-game-devops/docker/frontend/nginx.conf \
+             humor-memory-game/frontend/nginx.conf
+          cp humor-memory-game-devops/docker/frontend/start.sh \
+             humor-memory-game/frontend/start.sh
+
+      - name: 🏗️ Build and Push Backend Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./humor-memory-game/backend
+          file: ./humor-memory-game-devops/docker/backend/Dockerfile
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_OWNER }}/${{ env.BACKEND_IMAGE }}:latest
+            ${{ env.DOCKERHUB_OWNER }}/${{ env.BACKEND_IMAGE }}:main-${{ steps.short-sha.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 🏗️ Build and Push Frontend Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./humor-memory-game/frontend
+          file: ./humor-memory-game-devops/docker/frontend/Dockerfile
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_OWNER }}/${{ env.FRONTEND_IMAGE }}:latest
+            ${{ env.DOCKERHUB_OWNER }}/${{ env.FRONTEND_IMAGE }}:main-${{ steps.short-sha.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ============================================================
+  # JOB 4 — UPDATE GITOPS MANIFESTS
+  # Updates the image tags in the Kubernetes GitOps repository
+  # so ArgoCD detects the change and syncs the new images to
+  # the cluster automatically.
+  #
+  # Checks out the gitops branch of humor-memory-game-kubernetes
+  # using GITOPS_PAT (fine-grained PAT with Contents: Read and Write).
+  # Uses yq to update only the image field — no other YAML is touched.
+  # Commits with [skip ci] to prevent a recursive pipeline trigger.
+  # Pushes to the gitops branch — the branch ArgoCD watches.
+  # ============================================================
+  update-gitops:
+    name: 🔄 Update GitOps Manifests
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: 📥 Checkout GitOps Repository (gitops branch)
+        uses: actions/checkout@v4
+        with:
+          repository: sjchristie/humor-memory-game-kubernetes
+          token: ${{ secrets.GITOPS_PAT }}
+          ref: gitops
+
+      - name: 🔧 Install yq
+        run: |
+          sudo wget -q -O /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: 📝 Update Backend Image Tag
+        run: |
+          BACKEND_PATH="gitops-safe/base/10-backend-deployment.yaml"
+          NEW_TAG="${{ env.DOCKERHUB_OWNER }}/${{ env.BACKEND_IMAGE }}:main-${{ needs.build-and-push.outputs.short-sha }}"
+          if [ -f "$BACKEND_PATH" ]; then
+            yq -i ".spec.template.spec.containers[0].image = \"$NEW_TAG\"" "$BACKEND_PATH"
+            echo "✅ Backend image updated to $NEW_TAG"
+          else
+            echo "❌ Backend manifest not found at $BACKEND_PATH"
+            exit 1
+          fi
+
+      - name: 📝 Update Frontend Image Tag
+        run: |
+          FRONTEND_PATH="gitops-safe/base/12-frontend-deployment.yaml"
+          NEW_TAG="${{ env.DOCKERHUB_OWNER }}/${{ env.FRONTEND_IMAGE }}:main-${{ needs.build-and-push.outputs.short-sha }}"
+          if [ -f "$FRONTEND_PATH" ]; then
+            yq -i ".spec.template.spec.containers[0].image = \"$NEW_TAG\"" "$FRONTEND_PATH"
+            echo "✅ Frontend image updated to $NEW_TAG"
+          else
+            echo "❌ Frontend manifest not found at $FRONTEND_PATH"
+            exit 1
+          fi
+
+      - name: 💾 Commit and Push GitOps Changes
+        run: |
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add gitops-safe/base/10-backend-deployment.yaml
+          git add gitops-safe/base/12-frontend-deployment.yaml
+
+          if ! git diff-index --quiet HEAD; then
+            git commit -m "chore(gitops): update images to main-${{ needs.build-and-push.outputs.short-sha }} [skip ci]"
+            git push origin gitops
+            echo "✅ GitOps manifests updated and pushed to gitops branch"
+          else
+            echo "ℹ️  No manifest changes detected — images already at this SHA"
+          fi
+
+  # ============================================================
+  # JOB 5 — NOTIFY
+  # Reports the final pipeline status.
+  # Always runs regardless of whether previous jobs succeeded or failed.
+  # In production this step would send a Slack or webhook notification.
+  # ============================================================
+  notify:
+    name: 📢 Notify
+    runs-on: ubuntu-latest
+    needs: [update-gitops]
+    if: always()
+
+    steps:
+      - name: 📢 Report Pipeline Status
+        run: |
+          echo "=================================="
+          echo "  CI/CD Pipeline Complete"
+          echo "=================================="
+          echo "  Status:     ${{ job.status }}"
+          echo "  Repository: ${{ github.repository }}"
+          echo "  Branch:     ${{ github.ref_name }}"
+          echo "  Commit:     ${{ github.sha }}"
+          echo "  Actor:      ${{ github.actor }}"
+          echo "  Run:        ${{ github.run_number }}"
+          echo "=================================="
